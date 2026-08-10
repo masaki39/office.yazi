@@ -36,8 +36,16 @@ end
 -- is a cheap `pdftoppm` extraction from the cached PDF instead of a fresh
 -- `soffice` invocation.
 function M:doc2pdf(job)
-	local dir = "/tmp/yazi-" .. ya.uid() .. "/" .. ya.hash("office.yazi") .. "/"
-	local pdf = dir .. ya.hash(tostring(job.file.url)) .. ".pdf"
+	-- Key the cache dir on the file's url *and* its mtime/size, not just the
+	-- url: a stale PDF from before the source file was last edited must never
+	-- be served, and scoping each source file to its own subdirectory also
+	-- means two different files that happen to share a basename (or repeated
+	-- concurrent preloads of the same file) can never race on the same
+	-- intermediate output path below.
+	local cha = job.file.cha
+	local key = ya.hash(tostring(job.file.url) .. "|" .. tostring(cha and cha.mtime) .. "|" .. tostring(cha and cha.len))
+	local dir = "/tmp/yazi-" .. ya.uid() .. "/" .. ya.hash("office.yazi") .. "/" .. key .. "/"
+	local pdf = dir .. "cached.pdf"
 
 	if fs.cha(Url(pdf)) then
 		return pdf
@@ -48,7 +56,7 @@ function M:doc2pdf(job)
 	  2. Always writes the converted files to the filesystem, so no "Mario|Bros|Piping|Magic" for the data stream (https://ask.libreoffice.org/t/using-convert-to-output-to-stdout/38753)
 	  3. The `pdf:draw_pdf_Export` filter needs literal double quotes when defining its options (https://help.libreoffice.org/latest/en-US/text/shared/guide/pdf_params.html?&DbPAR=SHARED&System=UNIX#generaltext/shared/guide/pdf_params.xhp)
 	  3.1 Regarding double quotes and Lua strings, see https://www.lua.org/manual/5.1/manual.html#2.1 --]]
-	local libreoffice = Command("soffice")
+	local libreoffice, spawn_err = Command("soffice")
 		:arg({
 			"--headless",
 			"--convert-to",
@@ -62,7 +70,9 @@ function M:doc2pdf(job)
 		:stderr(Command.PIPED)
 		:output()
 
-	if not libreoffice.status.success then
+	if not libreoffice then
+		return nil, Err("Failed to start `soffice`, error: %s", spawn_err)
+	elseif not libreoffice.status.success then
 		local output = libreoffice.stdout .. libreoffice.stderr
 		local version = (output:match("LibreOffice .+") or ""):gsub("%\n.*", "")
 		local error = (output:match("Error:? .+") or ""):gsub("%\n.*", "")
@@ -108,12 +118,21 @@ function M:preload(job)
 	end
 
 	local total = self:page_count(pdf)
-	if total and job.skip >= total then
+	if not total then
+		-- `pdfinfo` failing (e.g. missing from PATH) only disables the
+		-- out-of-range guard below, it doesn't stop rendering — but that
+		-- should never happen silently, so surface it once.
+		ya.err("`pdfinfo` failed or is not installed; paging past the last page will not be caught")
+	elseif job.skip >= total then
 		-- Past the end of the document: we know the exact last page from
 		-- `pdfinfo`, so jump straight there instead of stepping back one page
-		-- (and one failed conversion) at a time.
+		-- (and one failed conversion) at a time. This must return an error too,
+		-- not just `true`: an empty `ok`/`err` pair would fall through to
+		-- `M:peek`'s `ya.image_show`, which would show whatever (nothing) was
+		-- cached for this out-of-range `job.skip` before the corrective peek
+		-- above lands.
 		ya.emit("peek", { math.max(0, total - 1), only_if = job.file.url, upper_bound = true })
-		return true
+		return true, Err("Page %d is past the end of `%s` (%d pages)", job.skip + 1, job.file.name, total)
 	end
 
 	local output, err = Command("pdftoppm")

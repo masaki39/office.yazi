@@ -33,6 +33,15 @@
 >   `pdftoppm`. Paging past the end now jumps straight to the real last page instead of guessing and stepping
 >   back one page at a time, a genuine conversion failure always surfaces as an error, and paging through an
 >   already-open document is much faster since only the first page triggers a `soffice` conversion.
+> - `main.lua`: follow-up fixes to the above, found by another review pass: the per-document PDF cache is now
+>   keyed on the file's mtime/size as well as its url, so editing a file and re-previewing it no longer serves a
+>   stale conversion, and each file gets its own cache subdirectory so two files that happen to share a basename
+>   can no longer race on the same intermediate output path. The "past the end of the document" case now returns
+>   an error alongside the corrective `peek`, matching every other failure path — returning bare `true` there
+>   skipped `M:peek`'s guard and could flash `ya.image_show` against a cache slot that was never written. A
+>   `soffice`/`pdfinfo` process that fails to spawn at all is now handled explicitly instead of crashing on a nil
+>   dereference, and a missing/failing `pdfinfo` now logs a warning instead of silently disabling the
+>   out-of-range-page guard.
 
 ## Installation
 > [!TIP]
