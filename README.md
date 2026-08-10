@@ -22,6 +22,9 @@
 >   for behavior.
 > - `README.md`: updated the example config below from the old `name = "*.docx"` rule key to `url = "*.docx"`,
 >   matching current Yazi config schema.
+> - `main.lua`: replaced `ya.manager_emit(...)` (seek) and `ya.mgr_emit(...)` (preload error recovery) with
+>   `ya.emit(...)`. Both were older, deprecated aliases; `manager_emit` in particular no longer works on recent
+>   Yazi, so paging with `J`/`K` while previewing a document silently did nothing and stayed stuck on page 1.
 
 ## Installation
 > [!TIP]
