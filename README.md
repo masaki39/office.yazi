@@ -9,6 +9,20 @@
 
 </div>
 
+> [!NOTE]
+> This is a personal fork of [macydnah/office.yazi](https://github.com/macydnah/office.yazi), maintained for my own dotfiles setup
+> because the upstream repository was unmaintained. Changes made in this fork:
+> - `main.lua`: run `soffice` instead of `libreoffice` — on macOS (Homebrew cask `libreoffice`) only `soffice` is
+>   put on `PATH`, so the upstream `libreoffice` call always failed. (On Linux, `soffice` is generally available too,
+>   e.g. as a symlink shipped alongside the `libreoffice` wrapper — if your distro truly lacks it, adjust the
+>   command back to `libreoffice`.)
+> - `main.lua`: removed the call to `ya.preview_widgets(job, {})`, which was deprecated/removed from Yazi's plugin
+>   API and made every preview fail with `attempt to call a nil value (field 'preview_widgets')` on recent Yazi
+>   versions (confirmed on Yazi 26.5.6). The call only ever passed an empty widget list, so dropping it is a no-op
+>   for behavior.
+> - `README.md`: updated the example config below from the old `name = "*.docx"` rule key to `url = "*.docx"`,
+>   matching current Yazi config schema.
+
 ## Installation
 > [!TIP]
 > Installing this plugin with `ya` will conveniently clone the plugin from GitHub,
@@ -16,16 +30,16 @@
 > 
 > To install it with `ya` run:
 > ```sh
-> ya pkg add macydnah/office
+> ya pkg add masaki39/office
 > ```
 
 > Or if you prefer a manual approach:
 > ```sh
 > ## For linux and MacOS
-> git clone https://github.com/macydnah/office.yazi.git ~/.config/yazi/plugins/office.yazi
+> git clone https://github.com/masaki39/office.yazi.git ~/.config/yazi/plugins/office.yazi
 > 
 > ## For Windows
-> git clone https://github.com/macydnah/office.yazi.git %AppData%\yazi\config\plugins\office.yazi
+> git clone https://github.com/masaki39/office.yazi.git %AppData%\yazi\config\plugins\office.yazi
 > ```
 
 ## Usage
@@ -46,7 +60,7 @@ prepend_preloaders = [
     { mime = "application/oasis.opendocument.*", run = "office" },
     { mime = "application/ms-*", run = "office" },
     { mime = "application/msword", run = "office" },
-    { name = "*.docx", run = "office" },
+    { url = "*.docx", run = "office" },
 ]
 
 prepend_previewers = [
@@ -55,7 +69,7 @@ prepend_previewers = [
     { mime = "application/oasis.opendocument.*", run = "office" },
     { mime = "application/ms-*", run = "office" },
     { mime = "application/msword", run = "office" },
-    { name = "*.docx", run = "office" },
+    { url = "*.docx", run = "office" },
 ]
 ```
 
@@ -63,7 +77,8 @@ prepend_previewers = [
 > [!IMPORTANT]
 > Make sure that these commands are installed in your system and can be found in `PATH`:
 >
-> - `libreoffice`
+> - `soffice` (installed with LibreOffice; on some Linux distros the wrapper script is named `libreoffice`
+>   instead — if so, edit `main.lua` to use that name)
 > - `pdftoppm`
 
 ## License
