@@ -26,11 +26,13 @@
 >   `ya.emit(...)`. Both were older, deprecated aliases; `manager_emit` in particular no longer works on recent
 >   Yazi, so paging with `J`/`K` while previewing a document silently did nothing and stayed stuck on page 1.
 > - `main.lua`: fixed paging past the last page. LibreOffice exits `0` even when the requested `PageRange` page
->   doesn't exist — it just never writes the output PDF — so `doc2pdf` now reports that specific case with a third
->   `out_of_range` return value, and `preload` only snaps the preview back to `job.skip - 1` when that flag is set.
->   A genuine conversion failure (corrupt file, crash, unsupported format) still surfaces as a real error instead
->   of being silently swallowed as "no such page". The `pdftoppm` failure branch no longer snaps back at all,
->   since by the time it runs `doc2pdf` already confirmed the page exists — a failure there is a rendering error,
+>   doesn't exist — it just never writes the output PDF, while still logging a `SfxBaseModel::impl_store ...
+>   failed` write error to stdout. `doc2pdf` now reports "no such page" via a third `out_of_range` return value
+>   only when that specific error text is present, and `preload` only snaps the preview back to `job.skip - 1`
+>   when that flag is set. A genuine conversion failure (corrupt file, crash, unsupported format, or a missing
+>   file with no matching error logged) still surfaces as a real error instead of being silently swallowed as
+>   "no such page". The `pdftoppm` failure branch no longer snaps back at all, since by the time it runs
+>   `doc2pdf` already confirmed the page exists — a failure there is a rendering error,
 >   not a missing page.
 
 ## Installation

@@ -47,8 +47,9 @@ function M:doc2pdf(job)
 		:stderr(Command.PIPED)
 		:output()
 
+	local output = libreoffice.stdout .. libreoffice.stderr
+
 	if not libreoffice.status.success then
-		local output = libreoffice.stdout .. libreoffice.stderr
 		local version = (output:match("LibreOffice .+") or ""):gsub("%\n.*", "")
 		local error = (output:match("Error:? .+") or ""):gsub("%\n.*", "")
 		if version ~= "" or error ~= "" then
@@ -61,10 +62,14 @@ function M:doc2pdf(job)
 	local read_permission = io.open(tmp, "r")
 	if not read_permission then
 		-- LibreOffice exits 0 even when the requested PageRange page is past the
-		-- end of the document; it just silently skips writing the output file.
-		-- A missing file after a *successful* exit means "no such page", which
-		-- callers need to tell apart from a genuine conversion failure.
-		return nil, Err("Failed to read `%s`: make sure file exists and have read access", tmp), true
+		-- end of the document; it just silently skips writing the output file,
+		-- while still logging a "SfxBaseModel::impl_store ... failed" write error
+		-- to stdout (see the block comment above). Only treat the missing file as
+		-- "no such page" when that specific signal is present — a missing file
+		-- with no matching error logged at all is too ambiguous to assume it's
+		-- just an out-of-range page, and must surface as a real error instead.
+		local out_of_range = output:match("SfxBaseModel::impl_store") ~= nil
+		return nil, Err("Failed to read `%s`: make sure file exists and have read access", tmp), out_of_range
 	end
 	read_permission:close()
 
