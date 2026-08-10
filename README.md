@@ -42,6 +42,18 @@
 >   `soffice`/`pdfinfo` process that fails to spawn at all is now handled explicitly instead of crashing on a nil
 >   dereference, and a missing/failing `pdfinfo` now logs a warning instead of silently disabling the
 >   out-of-range-page guard.
+> - `main.lua`: a fifth review pass found that a source document LibreOffice "successfully" converts to a
+>   0-page PDF (corrupt/protected/etc.) made the "past the end" branch compute a corrective target identical to
+>   `job.skip = 0`, causing an infinite `peek`/`preload`/`emit` loop for that file — a 0-page conversion is now
+>   treated as its own error instead. `pdfinfo`'s page count is now memoized per cached PDF instead of
+>   re-spawned on every page turn (the count can't change once a version is cached), the "pdfinfo missing"
+>   warning above now actually only logs once per session as its comment claims, a losing `fs.rename` in a
+>   same-file race is now treated as success instead of a spurious error (the winner already cached the file),
+>   and a redundant `io.open` existence check before `fs.rename` — which already reports a missing file on its
+>   own — was removed. Deliberately **not** addressed for now: cache entries for old versions of an edited file
+>   are not evicted (each new version gets its own subdirectory, so `/tmp` usage grows with edits; acceptable
+>   for a personal, session-scoped tmpdir), and the cache key doesn't fall back to anything if a filesystem
+>   doesn't report `mtime` (rare enough in practice not to be worth the complexity).
 
 ## Installation
 > [!TIP]

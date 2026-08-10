@@ -83,27 +83,39 @@ function M:doc2pdf(job)
 	end
 
 	local out = dir .. job.file.name:gsub("%.[^%.]+$", ".pdf")
-	local read_permission = io.open(out, "r")
-	if not read_permission then
-		return nil, Err("Failed to read `%s`: make sure file exists and have read access", out)
-	end
-	read_permission:close()
 
 	local renamed, rn_err = fs.rename(Url(out), Url(pdf))
 	if not renamed then
+		if fs.cha(Url(pdf)) then
+			-- A concurrent doc2pdf call for the same file already won this race
+			-- and moved `out` into place first; that's success, not a failure.
+			return pdf
+		end
 		return nil, Err("Failed to cache `%s` as `%s`: %s", out, pdf, rn_err)
 	end
 
 	return pdf
 end
 
--- Total page count of `pdf`, or nil if it can't be determined.
+-- Total page count of `pdf`, or nil if it can't be determined. `pdf`'s cache
+-- path is keyed on the source file's mtime/size (see doc2pdf), so its page
+-- count can never change for a given cache entry — memoize it instead of
+-- re-spawning `pdfinfo` on every single page turn.
 function M:page_count(pdf)
+	M.page_counts = M.page_counts or {}
+	local cached = M.page_counts[pdf]
+	if cached ~= nil then
+		return cached
+	end
+
 	local output = Command("pdfinfo"):arg({ tostring(pdf) }):stdout(Command.PIPED):stderr(Command.PIPED):output()
 	if not output or not output.status.success then
 		return nil
 	end
-	return tonumber(output.stdout:match("Pages:%s*(%d+)"))
+
+	local total = tonumber(output.stdout:match("Pages:%s*(%d+)"))
+	M.page_counts[pdf] = total
+	return total
 end
 
 function M:preload(job)
@@ -121,8 +133,19 @@ function M:preload(job)
 	if not total then
 		-- `pdfinfo` failing (e.g. missing from PATH) only disables the
 		-- out-of-range guard below, it doesn't stop rendering — but that
-		-- should never happen silently, so surface it once.
-		ya.err("`pdfinfo` failed or is not installed; paging past the last page will not be caught")
+		-- should never happen silently, so surface it once per session rather
+		-- than on every single page turn.
+		if not M.warned_no_pdfinfo then
+			M.warned_no_pdfinfo = true
+			ya.err("`pdfinfo` failed or is not installed; paging past the last page will not be caught")
+		end
+	elseif total == 0 then
+		-- A "successfully" converted but empty PDF (corrupt/protected source,
+		-- ...) has no valid page at all. Must not fall into the branch below:
+		-- its target page would be math.max(0, 0-1) = 0, identical to the
+		-- job.skip = 0 that got us here, which would emit a `peek` back to the
+		-- same skip forever.
+		return true, Err("`%s` converted to an empty PDF (0 pages)", job.file.name)
 	elseif job.skip >= total then
 		-- Past the end of the document: we know the exact last page from
 		-- `pdfinfo`, so jump straight there instead of stepping back one page
@@ -131,7 +154,7 @@ function M:preload(job)
 		-- `M:peek`'s `ya.image_show`, which would show whatever (nothing) was
 		-- cached for this out-of-range `job.skip` before the corrective peek
 		-- above lands.
-		ya.emit("peek", { math.max(0, total - 1), only_if = job.file.url, upper_bound = true })
+		ya.emit("peek", { total - 1, only_if = job.file.url, upper_bound = true })
 		return true, Err("Page %d is past the end of `%s` (%d pages)", job.skip + 1, job.file.name, total)
 	end
 
