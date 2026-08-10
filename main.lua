@@ -2,6 +2,20 @@
 
 local M = {}
 
+-- Run an already-configured `cmd`, returning its Output on success or
+-- `nil, Err(...)` if the process couldn't even be spawned (missing binary,
+-- etc.). Doesn't look at `output.status.success` — callers still need to
+-- branch on that themselves, since a non-zero exit isn't always a hard
+-- failure (e.g. LibreOffice's own quirks around PageRange, handled by the
+-- caller in doc2pdf).
+local function run(name, cmd)
+	local output, err = cmd:output()
+	if not output then
+		return nil, Err("Failed to start `%s`, error: %s", name, err)
+	end
+	return output
+end
+
 function M:peek(job)
 	local start, cache = os.clock(), ya.file_cache(job)
 	if not cache then
@@ -38,40 +52,54 @@ end
 function M:doc2pdf(job)
 	-- Key the cache dir on the file's url *and* its mtime/size, not just the
 	-- url: a stale PDF from before the source file was last edited must never
-	-- be served, and scoping each source file to its own subdirectory also
-	-- means two different files that happen to share a basename (or repeated
-	-- concurrent preloads of the same file) can never race on the same
-	-- intermediate output path below.
+	-- be served, and scoping each source file to its own subdirectory means
+	-- two different files that happen to share a basename can never collide
+	-- in the cache.
 	local cha = job.file.cha
 	local key = ya.hash(tostring(job.file.url) .. "|" .. tostring(cha and cha.mtime) .. "|" .. tostring(cha and cha.len))
-	local dir = "/tmp/yazi-" .. ya.uid() .. "/" .. ya.hash("office.yazi") .. "/" .. key .. "/"
-	local pdf = dir .. "cached.pdf"
+	local base = "/tmp/yazi-" .. ya.uid() .. "/" .. ya.hash("office.yazi") .. "/" .. key .. "/"
+	local pdf = base .. "cached.pdf"
 
 	if fs.cha(Url(pdf)) then
 		return pdf
 	end
+
+	-- soffice writes to `--outdir <scratch>/<basename>.pdf` before we rename
+	-- it into the stable `pdf` cache path. Give every conversion attempt its
+	-- own scratch directory (an in-process counter is enough: two concurrent
+	-- doc2pdf calls only ever interleave at an `await` point inside `run`,
+	-- never between reading and incrementing this) so that two overlapping
+	-- attempts for the same file — plausible if a page is turned again before
+	-- the first conversion finishes — never have two `soffice` processes
+	-- writing the same file at once. Only the final rename below is still
+	-- shared, and that race is already handled: the loser just adopts the
+	-- winner's result.
+	M.scratch_seq = (M.scratch_seq or 0) + 1
+	local scratch = base .. "scratch-" .. M.scratch_seq .. "/"
 
 	--[[	For Future Reference: Regarding `libreoffice` as preconverter
 	  1. It prints errors to stdout (always, doesn't matter if it succeeded or it failed)
 	  2. Always writes the converted files to the filesystem, so no "Mario|Bros|Piping|Magic" for the data stream (https://ask.libreoffice.org/t/using-convert-to-output-to-stdout/38753)
 	  3. The `pdf:draw_pdf_Export` filter needs literal double quotes when defining its options (https://help.libreoffice.org/latest/en-US/text/shared/guide/pdf_params.html?&DbPAR=SHARED&System=UNIX#generaltext/shared/guide/pdf_params.xhp)
 	  3.1 Regarding double quotes and Lua strings, see https://www.lua.org/manual/5.1/manual.html#2.1 --]]
-	local libreoffice, spawn_err = Command("soffice")
-		:arg({
-			"--headless",
-			"--convert-to",
-			"pdf:draw_pdf_Export",
-			"--outdir",
-			dir,
-			tostring(job.file.url),
-		})
-		:stdin(Command.NULL)
-		:stdout(Command.PIPED)
-		:stderr(Command.PIPED)
-		:output()
+	local libreoffice, err = run(
+		"soffice",
+		Command("soffice")
+			:arg({
+				"--headless",
+				"--convert-to",
+				"pdf:draw_pdf_Export",
+				"--outdir",
+				scratch,
+				tostring(job.file.url),
+			})
+			:stdin(Command.NULL)
+			:stdout(Command.PIPED)
+			:stderr(Command.PIPED)
+	)
 
 	if not libreoffice then
-		return nil, Err("Failed to start `soffice`, error: %s", spawn_err)
+		return nil, err
 	elseif not libreoffice.status.success then
 		local output = libreoffice.stdout .. libreoffice.stderr
 		local version = (output:match("LibreOffice .+") or ""):gsub("%\n.*", "")
@@ -79,16 +107,19 @@ function M:doc2pdf(job)
 		if version ~= "" or error ~= "" then
 			ya.err((version or "LibreOffice") .. " " .. (error or "Unknown error"))
 		end
+		fs.remove("dir_all", Url(scratch))
 		return nil, Err("Failed to convert `%s` to a temporary PDF", job.file.name)
 	end
 
-	local out = dir .. job.file.name:gsub("%.[^%.]+$", ".pdf")
+	local out = scratch .. job.file.name:gsub("%.[^%.]+$", ".pdf")
 
 	local renamed, rn_err = fs.rename(Url(out), Url(pdf))
+	fs.remove("dir_all", Url(scratch))
 	if not renamed then
 		if fs.cha(Url(pdf)) then
 			-- A concurrent doc2pdf call for the same file already won this race
-			-- and moved `out` into place first; that's success, not a failure.
+			-- and moved its own output into place first; that's success, not a
+			-- failure.
 			return pdf
 		end
 		return nil, Err("Failed to cache `%s` as `%s`: %s", out, pdf, rn_err)
@@ -99,22 +130,25 @@ end
 
 -- Total page count of `pdf`, or nil if it can't be determined. `pdf`'s cache
 -- path is keyed on the source file's mtime/size (see doc2pdf), so its page
--- count can never change for a given cache entry — memoize it instead of
--- re-spawning `pdfinfo` on every single page turn.
+-- count can never change for a given cache entry — memoize it (including
+-- failures, via a `false` sentinel so a nil result is still distinguishable
+-- from "not computed yet") instead of re-spawning `pdfinfo` on every single
+-- page turn.
 function M:page_count(pdf)
 	M.page_counts = M.page_counts or {}
 	local cached = M.page_counts[pdf]
 	if cached ~= nil then
-		return cached
+		return cached or nil
 	end
 
-	local output = Command("pdfinfo"):arg({ tostring(pdf) }):stdout(Command.PIPED):stderr(Command.PIPED):output()
+	local output = run("pdfinfo", Command("pdfinfo"):arg({ tostring(pdf) }):stdout(Command.PIPED):stderr(Command.PIPED))
 	if not output or not output.status.success then
+		M.page_counts[pdf] = false
 		return nil
 	end
 
 	local total = tonumber(output.stdout:match("Pages:%s*(%d+)"))
-	M.page_counts[pdf] = total
+	M.page_counts[pdf] = total or false
 	return total
 end
 
@@ -131,13 +165,14 @@ function M:preload(job)
 
 	local total = self:page_count(pdf)
 	if not total then
-		-- `pdfinfo` failing (e.g. missing from PATH) only disables the
-		-- out-of-range guard below, it doesn't stop rendering — but that
-		-- should never happen silently, so surface it once per session rather
-		-- than on every single page turn.
+		-- `pdfinfo` failing (e.g. missing from PATH) disables the exact
+		-- out-of-range guard below, but pdftoppm's own "past the last page"
+		-- error further down is still parsed as a fallback — this should
+		-- never happen silently, though, so surface it once per session
+		-- rather than on every single page turn.
 		if not M.warned_no_pdfinfo then
 			M.warned_no_pdfinfo = true
-			ya.err("`pdfinfo` failed or is not installed; paging past the last page will not be caught")
+			ya.err("`pdfinfo` failed or is not installed; falling back to a less precise page-range check")
 		end
 	elseif total == 0 then
 		-- A "successfully" converted but empty PDF (corrupt/protected source,
@@ -158,23 +193,35 @@ function M:preload(job)
 		return true, Err("Page %d is past the end of `%s` (%d pages)", job.skip + 1, job.file.name, total)
 	end
 
-	local output, err = Command("pdftoppm")
-		:arg({
-			"-singlefile",
-			"-jpeg",
-			"-jpegopt",
-			"quality=" .. rt.preview.image_quality,
-			"-f",
-			job.skip + 1,
-			tostring(pdf),
-		})
-		:stdout(Command.PIPED)
-		:stderr(Command.PIPED)
-		:output()
+	local output, err = run(
+		"pdftoppm",
+		Command("pdftoppm")
+			:arg({
+				"-singlefile",
+				"-jpeg",
+				"-jpegopt",
+				"quality=" .. rt.preview.image_quality,
+				"-f",
+				job.skip + 1,
+				tostring(pdf),
+			})
+			:stdout(Command.PIPED)
+			:stderr(Command.PIPED)
+	)
 
 	if not output then
-		return true, Err("Failed to start `pdftoppm`, error: %s", err)
+		return true, err
 	elseif not output.status.success then
+		-- Only relevant when `total` above is nil (no `pdfinfo`): pdftoppm's
+		-- own validation of the page we asked for reports the document's real
+		-- last page, so use it to self-correct the same way the `pdfinfo` path
+		-- does, instead of getting permanently stuck on a failed page.
+		if not total then
+			local last = tonumber(output.stderr:match("the last page %((%d+)%)"))
+			if last and job.skip > last - 1 then
+				ya.emit("peek", { math.max(0, last - 1), only_if = job.file.url, upper_bound = true })
+			end
+		end
 		return true, Err("Failed to convert %s to image, stderr: %s", pdf, output.stderr)
 	end
 

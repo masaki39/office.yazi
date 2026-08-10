@@ -54,6 +54,16 @@
 >   are not evicted (each new version gets its own subdirectory, so `/tmp` usage grows with edits; acceptable
 >   for a personal, session-scoped tmpdir), and the cache key doesn't fall back to anything if a filesystem
 >   doesn't report `mtime` (rare enough in practice not to be worth the complexity).
+> - `main.lua`: a sixth review pass found that two overlapping `doc2pdf` calls for the same not-yet-cached file
+>   (plausible if a page is turned again before the first conversion finishes) both had `soffice` write to the
+>   *same* intermediate output path at once — the previous fix only handled the final rename racing, not this
+>   earlier write. Each conversion attempt now gets its own scratch directory, so only the (already-handled)
+>   final rename is ever shared. Also: when `pdfinfo` is unavailable, paging past the end used to just hard-fail
+>   with no recovery; `pdftoppm`'s own "the first page (N) can not be after the last page (M)" error is now
+>   parsed as a fallback so it still self-corrects. Fixed `page_count`'s memoization: storing a `nil` result in a
+>   Lua table is a no-op, so an unparseable-but-successful `pdfinfo` call was silently re-spawning `pdfinfo` on
+>   every page turn instead of memoizing the failure. And the repeated "spawn a command, handle it not starting
+>   at all" shape used for `soffice`/`pdfinfo`/`pdftoppm` is now one small `run()` helper instead of three copies.
 
 ## Installation
 > [!TIP]
