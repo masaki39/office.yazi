@@ -75,6 +75,12 @@ function M:preload(job)
 
 	local tmp_pdf, err = self:doc2pdf(job)
 	if not tmp_pdf then
+		-- LibreOffice exits 0 even when the requested page is past the end of the
+		-- document, it just never writes the output file. Treat that as "there is
+		-- no such page" and snap the preview back to the last page that rendered.
+		if job.skip > 0 then
+			ya.emit("peek", { job.skip - 1, only_if = job.file.url, upper_bound = true })
+		end
 		return true, Err("    " .. "%s", err)
 	end
 
@@ -100,9 +106,8 @@ function M:preload(job)
 	if not output then
 		return true, Err("Failed to start `pdftoppm`, error: %s", err)
 	elseif not output.status.success then
-		local pages = tonumber(output.stderr:match("the last page %((%d+)%)")) or 0
-		if job.skip > 0 and pages > 0 then
-			ya.emit("peek", { math.max(0, pages - 1), only_if = job.file.url, upper_bound = true })
+		if job.skip > 0 then
+			ya.emit("peek", { job.skip - 1, only_if = job.file.url, upper_bound = true })
 		end
 		return true, Err("Failed to convert %s to image, stderr: %s", tmp_pdf, output.stderr)
 	end

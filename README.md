@@ -25,6 +25,10 @@
 > - `main.lua`: replaced `ya.manager_emit(...)` (seek) and `ya.mgr_emit(...)` (preload error recovery) with
 >   `ya.emit(...)`. Both were older, deprecated aliases; `manager_emit` in particular no longer works on recent
 >   Yazi, so paging with `J`/`K` while previewing a document silently did nothing and stayed stuck on page 1.
+> - `main.lua`: fixed paging past the last page. LibreOffice exits `0` even when the requested `PageRange` page
+>   doesn't exist — it just never writes the output PDF — so the "convert failed" recovery paths now snap the
+>   preview back to `job.skip - 1` (the previous page) whenever a page fails to render, instead of only handling
+>   a `pdftoppm` error case that could never actually fire with this plugin's one-page-at-a-time conversion.
 
 ## Installation
 > [!TIP]
