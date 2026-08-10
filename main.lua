@@ -60,7 +60,11 @@ function M:doc2pdf(job)
 	local tmp = tmp .. job.file.name:gsub("%.[^%.]+$", ".pdf")
 	local read_permission = io.open(tmp, "r")
 	if not read_permission then
-		return nil, Err("Failed to read `%s`: make sure file exists and have read access", tmp)
+		-- LibreOffice exits 0 even when the requested PageRange page is past the
+		-- end of the document; it just silently skips writing the output file.
+		-- A missing file after a *successful* exit means "no such page", which
+		-- callers need to tell apart from a genuine conversion failure.
+		return nil, Err("Failed to read `%s`: make sure file exists and have read access", tmp), true
 	end
 	read_permission:close()
 
@@ -73,12 +77,13 @@ function M:preload(job)
 		return true
 	end
 
-	local tmp_pdf, err = self:doc2pdf(job)
+	local tmp_pdf, err, out_of_range = self:doc2pdf(job)
 	if not tmp_pdf then
-		-- LibreOffice exits 0 even when the requested page is past the end of the
-		-- document, it just never writes the output file. Treat that as "there is
-		-- no such page" and snap the preview back to the last page that rendered.
-		if job.skip > 0 then
+		-- Only snap back to the previous page when we positively know the current
+		-- one doesn't exist; a genuine conversion failure (corrupt file, crash,
+		-- unsupported format, ...) must surface as an error, not be silently
+		-- swallowed by rewinding the page counter.
+		if out_of_range and job.skip > 0 then
 			ya.emit("peek", { job.skip - 1, only_if = job.file.url, upper_bound = true })
 		end
 		return true, Err("    " .. "%s", err)
@@ -106,9 +111,10 @@ function M:preload(job)
 	if not output then
 		return true, Err("Failed to start `pdftoppm`, error: %s", err)
 	elseif not output.status.success then
-		if job.skip > 0 then
-			ya.emit("peek", { job.skip - 1, only_if = job.file.url, upper_bound = true })
-		end
+		-- doc2pdf already succeeded at this point, meaning the requested page does
+		-- exist and was exported to tmp_pdf; a pdftoppm failure here is a genuine
+		-- rendering error (OOM, disk full, corrupt temp PDF, ...), not a missing
+		-- page, so it must not be treated as an out-of-range page.
 		return true, Err("Failed to convert %s to image, stderr: %s", tmp_pdf, output.stderr)
 	end
 
