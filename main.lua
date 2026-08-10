@@ -25,8 +25,23 @@ function M:seek(job)
 	end
 end
 
+-- Convert the *whole* document to PDF once and cache it, instead of asking
+-- LibreOffice to export a single page at a time. This is deliberately
+-- different from a straightforward per-page `--convert-to ... PageRange`
+-- call: LibreOffice exits 0 and prints nothing conclusive when a requested
+-- page is past the end of the document (it just skips writing the file), so
+-- there is no reliable way to tell "no such page" apart from a genuine
+-- conversion failure by probing one page at a time. Converting once gives us
+-- an authoritative page count via `pdfinfo`, and every page after the first
+-- is a cheap `pdftoppm` extraction from the cached PDF instead of a fresh
+-- `soffice` invocation.
 function M:doc2pdf(job)
-	local tmp = "/tmp/yazi-" .. ya.uid() .. "/" .. ya.hash("office.yazi") .. "/"
+	local dir = "/tmp/yazi-" .. ya.uid() .. "/" .. ya.hash("office.yazi") .. "/"
+	local pdf = dir .. ya.hash(tostring(job.file.url)) .. ".pdf"
+
+	if fs.cha(Url(pdf)) then
+		return pdf
+	end
 
 	--[[	For Future Reference: Regarding `libreoffice` as preconverter
 	  1. It prints errors to stdout (always, doesn't matter if it succeeded or it failed)
@@ -37,9 +52,9 @@ function M:doc2pdf(job)
 		:arg({
 			"--headless",
 			"--convert-to",
-			'pdf:draw_pdf_Export:{"PageRange":{"type":"string","value":"' .. job.skip + 1 .. '"}}',
+			"pdf:draw_pdf_Export",
 			"--outdir",
-			tmp,
+			dir,
 			tostring(job.file.url),
 		})
 		:stdin(Command.NULL)
@@ -47,33 +62,38 @@ function M:doc2pdf(job)
 		:stderr(Command.PIPED)
 		:output()
 
-	local output = libreoffice.stdout .. libreoffice.stderr
-
 	if not libreoffice.status.success then
+		local output = libreoffice.stdout .. libreoffice.stderr
 		local version = (output:match("LibreOffice .+") or ""):gsub("%\n.*", "")
 		local error = (output:match("Error:? .+") or ""):gsub("%\n.*", "")
 		if version ~= "" or error ~= "" then
 			ya.err((version or "LibreOffice") .. " " .. (error or "Unknown error"))
 		end
-		return nil, Err("Failed to preconvert `%s` to a temporary PDF", job.file.name)
+		return nil, Err("Failed to convert `%s` to a temporary PDF", job.file.name)
 	end
 
-	local tmp = tmp .. job.file.name:gsub("%.[^%.]+$", ".pdf")
-	local read_permission = io.open(tmp, "r")
+	local out = dir .. job.file.name:gsub("%.[^%.]+$", ".pdf")
+	local read_permission = io.open(out, "r")
 	if not read_permission then
-		-- LibreOffice exits 0 even when the requested PageRange page is past the
-		-- end of the document; it just silently skips writing the output file,
-		-- while still logging a "SfxBaseModel::impl_store ... failed" write error
-		-- to stdout (see the block comment above). Only treat the missing file as
-		-- "no such page" when that specific signal is present — a missing file
-		-- with no matching error logged at all is too ambiguous to assume it's
-		-- just an out-of-range page, and must surface as a real error instead.
-		local out_of_range = output:match("SfxBaseModel::impl_store") ~= nil
-		return nil, Err("Failed to read `%s`: make sure file exists and have read access", tmp), out_of_range
+		return nil, Err("Failed to read `%s`: make sure file exists and have read access", out)
 	end
 	read_permission:close()
 
-	return tmp
+	local renamed, rn_err = fs.rename(Url(out), Url(pdf))
+	if not renamed then
+		return nil, Err("Failed to cache `%s` as `%s`: %s", out, pdf, rn_err)
+	end
+
+	return pdf
+end
+
+-- Total page count of `pdf`, or nil if it can't be determined.
+function M:page_count(pdf)
+	local output = Command("pdfinfo"):arg({ tostring(pdf) }):stdout(Command.PIPED):stderr(Command.PIPED):output()
+	if not output or not output.status.success then
+		return nil
+	end
+	return tonumber(output.stdout:match("Pages:%s*(%d+)"))
 end
 
 function M:preload(job)
@@ -82,16 +102,18 @@ function M:preload(job)
 		return true
 	end
 
-	local tmp_pdf, err, out_of_range = self:doc2pdf(job)
-	if not tmp_pdf then
-		-- Only snap back to the previous page when we positively know the current
-		-- one doesn't exist; a genuine conversion failure (corrupt file, crash,
-		-- unsupported format, ...) must surface as an error, not be silently
-		-- swallowed by rewinding the page counter.
-		if out_of_range and job.skip > 0 then
-			ya.emit("peek", { job.skip - 1, only_if = job.file.url, upper_bound = true })
-		end
+	local pdf, err = self:doc2pdf(job)
+	if not pdf then
 		return true, Err("    " .. "%s", err)
+	end
+
+	local total = self:page_count(pdf)
+	if total and job.skip >= total then
+		-- Past the end of the document: we know the exact last page from
+		-- `pdfinfo`, so jump straight there instead of stepping back one page
+		-- (and one failed conversion) at a time.
+		ya.emit("peek", { math.max(0, total - 1), only_if = job.file.url, upper_bound = true })
+		return true
 	end
 
 	local output, err = Command("pdftoppm")
@@ -101,26 +123,17 @@ function M:preload(job)
 			"-jpegopt",
 			"quality=" .. rt.preview.image_quality,
 			"-f",
-			1,
-			tostring(tmp_pdf),
+			job.skip + 1,
+			tostring(pdf),
 		})
 		:stdout(Command.PIPED)
 		:stderr(Command.PIPED)
 		:output()
 
-	local rm_tmp_pdf, rm_err = fs.remove("file", Url(tmp_pdf))
-	if not rm_tmp_pdf then
-		return true, Err("Failed to remove %s, error: %s", tmp_pdf, rm_err)
-	end
-
 	if not output then
 		return true, Err("Failed to start `pdftoppm`, error: %s", err)
 	elseif not output.status.success then
-		-- doc2pdf already succeeded at this point, meaning the requested page does
-		-- exist and was exported to tmp_pdf; a pdftoppm failure here is a genuine
-		-- rendering error (OOM, disk full, corrupt temp PDF, ...), not a missing
-		-- page, so it must not be treated as an out-of-range page.
-		return true, Err("Failed to convert %s to image, stderr: %s", tmp_pdf, output.stderr)
+		return true, Err("Failed to convert %s to image, stderr: %s", pdf, output.stderr)
 	end
 
 	return fs.write(cache, output.stdout)

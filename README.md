@@ -25,15 +25,14 @@
 > - `main.lua`: replaced `ya.manager_emit(...)` (seek) and `ya.mgr_emit(...)` (preload error recovery) with
 >   `ya.emit(...)`. Both were older, deprecated aliases; `manager_emit` in particular no longer works on recent
 >   Yazi, so paging with `J`/`K` while previewing a document silently did nothing and stayed stuck on page 1.
-> - `main.lua`: fixed paging past the last page. LibreOffice exits `0` even when the requested `PageRange` page
->   doesn't exist — it just never writes the output PDF, while still logging a `SfxBaseModel::impl_store ...
->   failed` write error to stdout. `doc2pdf` now reports "no such page" via a third `out_of_range` return value
->   only when that specific error text is present, and `preload` only snaps the preview back to `job.skip - 1`
->   when that flag is set. A genuine conversion failure (corrupt file, crash, unsupported format, or a missing
->   file with no matching error logged) still surfaces as a real error instead of being silently swallowed as
->   "no such page". The `pdftoppm` failure branch no longer snaps back at all, since by the time it runs
->   `doc2pdf` already confirmed the page exists — a failure there is a rendering error,
->   not a missing page.
+> - `main.lua`: reworked paging past the last page. The plugin used to ask LibreOffice to export one page at a
+>   time via `PageRange`, and had to *guess* whether a missing output file meant "no such page" or a genuine
+>   conversion failure — LibreOffice exits `0` either way, and the only distinguishing signal was an internal,
+>   version/locale-dependent log string. `doc2pdf` now converts the *whole* document to PDF once (cached per
+>   file), and `preload` reads the exact page count from that PDF via `pdfinfo` before extracting a page with
+>   `pdftoppm`. Paging past the end now jumps straight to the real last page instead of guessing and stepping
+>   back one page at a time, a genuine conversion failure always surfaces as an error, and paging through an
+>   already-open document is much faster since only the first page triggers a `soffice` conversion.
 
 ## Installation
 > [!TIP]
@@ -92,6 +91,7 @@ prepend_previewers = [
 > - `soffice` (installed with LibreOffice; on some Linux distros the wrapper script is named `libreoffice`
 >   instead — if so, edit `main.lua` to use that name)
 > - `pdftoppm`
+> - `pdfinfo` (both are part of `poppler`/`poppler-utils`, usually installed alongside `pdftoppm`)
 
 ## License
 office.yazi is licensed under the terms of the [MIT License](LICENSE)
