@@ -10,60 +10,29 @@
 </div>
 
 > [!NOTE]
-> This is a personal fork of [macydnah/office.yazi](https://github.com/macydnah/office.yazi), maintained for my own dotfiles setup
-> because the upstream repository was unmaintained. Changes made in this fork:
-> - `main.lua`: run `soffice` instead of `libreoffice` — on macOS (Homebrew cask `libreoffice`) only `soffice` is
->   put on `PATH`, so the upstream `libreoffice` call always failed. (On Linux, `soffice` is generally available too,
->   e.g. as a symlink shipped alongside the `libreoffice` wrapper — if your distro truly lacks it, adjust the
->   command back to `libreoffice`.)
-> - `main.lua`: removed the call to `ya.preview_widgets(job, {})`, which was deprecated/removed from Yazi's plugin
->   API and made every preview fail with `attempt to call a nil value (field 'preview_widgets')` on recent Yazi
->   versions (confirmed on Yazi 26.5.6). The call only ever passed an empty widget list, so dropping it is a no-op
->   for behavior.
-> - `README.md`: updated the example config below from the old `name = "*.docx"` rule key to `url = "*.docx"`,
->   matching current Yazi config schema.
-> - `main.lua`: replaced `ya.manager_emit(...)` (seek) and `ya.mgr_emit(...)` (preload error recovery) with
->   `ya.emit(...)`. Both were older, deprecated aliases; `manager_emit` in particular no longer works on recent
->   Yazi, so paging with `J`/`K` while previewing a document silently did nothing and stayed stuck on page 1.
-> - `main.lua`: reworked paging past the last page. The plugin used to ask LibreOffice to export one page at a
->   time via `PageRange`, and had to *guess* whether a missing output file meant "no such page" or a genuine
->   conversion failure — LibreOffice exits `0` either way, and the only distinguishing signal was an internal,
->   version/locale-dependent log string. `doc2pdf` now converts the *whole* document to PDF once (cached per
->   file), and `preload` reads the exact page count from that PDF via `pdfinfo` before extracting a page with
->   `pdftoppm`. Paging past the end now jumps straight to the real last page instead of guessing and stepping
->   back one page at a time, a genuine conversion failure always surfaces as an error, and paging through an
->   already-open document is much faster since only the first page triggers a `soffice` conversion.
-> - `main.lua`: follow-up fixes to the above, found by another review pass: the per-document PDF cache is now
->   keyed on the file's mtime/size as well as its url, so editing a file and re-previewing it no longer serves a
->   stale conversion, and each file gets its own cache subdirectory so two files that happen to share a basename
->   can no longer race on the same intermediate output path. The "past the end of the document" case now returns
->   an error alongside the corrective `peek`, matching every other failure path — returning bare `true` there
->   skipped `M:peek`'s guard and could flash `ya.image_show` against a cache slot that was never written. A
->   `soffice`/`pdfinfo` process that fails to spawn at all is now handled explicitly instead of crashing on a nil
->   dereference, and a missing/failing `pdfinfo` now logs a warning instead of silently disabling the
->   out-of-range-page guard.
-> - `main.lua`: a fifth review pass found that a source document LibreOffice "successfully" converts to a
->   0-page PDF (corrupt/protected/etc.) made the "past the end" branch compute a corrective target identical to
->   `job.skip = 0`, causing an infinite `peek`/`preload`/`emit` loop for that file — a 0-page conversion is now
->   treated as its own error instead. `pdfinfo`'s page count is now memoized per cached PDF instead of
->   re-spawned on every page turn (the count can't change once a version is cached), the "pdfinfo missing"
->   warning above now actually only logs once per session as its comment claims, a losing `fs.rename` in a
->   same-file race is now treated as success instead of a spurious error (the winner already cached the file),
->   and a redundant `io.open` existence check before `fs.rename` — which already reports a missing file on its
->   own — was removed. Deliberately **not** addressed for now: cache entries for old versions of an edited file
->   are not evicted (each new version gets its own subdirectory, so `/tmp` usage grows with edits; acceptable
->   for a personal, session-scoped tmpdir), and the cache key doesn't fall back to anything if a filesystem
->   doesn't report `mtime` (rare enough in practice not to be worth the complexity).
-> - `main.lua`: a sixth review pass found that two overlapping `doc2pdf` calls for the same not-yet-cached file
->   (plausible if a page is turned again before the first conversion finishes) both had `soffice` write to the
->   *same* intermediate output path at once — the previous fix only handled the final rename racing, not this
->   earlier write. Each conversion attempt now gets its own scratch directory, so only the (already-handled)
->   final rename is ever shared. Also: when `pdfinfo` is unavailable, paging past the end used to just hard-fail
->   with no recovery; `pdftoppm`'s own "the first page (N) can not be after the last page (M)" error is now
->   parsed as a fallback so it still self-corrects. Fixed `page_count`'s memoization: storing a `nil` result in a
->   Lua table is a no-op, so an unparseable-but-successful `pdfinfo` call was silently re-spawning `pdfinfo` on
->   every page turn instead of memoizing the failure. And the repeated "spawn a command, handle it not starting
->   at all" shape used for `soffice`/`pdfinfo`/`pdftoppm` is now one small `run()` helper instead of three copies.
+> This is a personal fork of [macydnah/office.yazi](https://github.com/macydnah/office.yazi), maintained for my own
+> dotfiles setup because the upstream repository was unmaintained. Changes made in this fork:
+> - Use `soffice` instead of `libreoffice` (only `soffice` is on `PATH` with the macOS Homebrew cask), and replace
+>   the deprecated `ya.manager_emit`/`ya.mgr_emit`/`ya.preview_widgets` calls with their current Yazi APIs — all
+>   of these had silently stopped working (broken previews, and `J`/`K` paging stuck on page 1) on recent Yazi.
+> - Convert the whole document to PDF once per file (cached, keyed on url + mtime/size) instead of asking
+>   LibreOffice to export one page at a time, and read the real page count via `pdfinfo` instead of guessing
+>   from LibreOffice's inconclusive exit status. Paging is faster (only the first page triggers a conversion)
+>   and paging past the last page reliably renders the real last page instead of a blank/black preview.
+> - Update the example config in this README from the old `name = "*.docx"` rule key to `url = "*.docx"`.
+
+<details>
+<summary>Fork changelog (older/incremental fixes)</summary>
+
+> - Fixed a bug where a source document that "successfully" converts to a 0-page PDF (corrupt/protected/etc.)
+>   caused an infinite peek loop.
+> - Fixed a race where two overlapping conversions of the same not-yet-cached file could collide on the same
+>   intermediate output path, and memoized `pdfinfo`'s page count instead of re-spawning it on every page turn.
+> - Fixed `M:seek` (paging past the last page) requesting an ever-growing, unclamped page index from Yazi core:
+>   the document would stay stuck on the last page until "previous" was pressed as many times as "next" had
+>   overshot by. The requested page is now clamped to the last known page count before being requested.
+
+</details>
 
 ## Installation
 > [!TIP]
