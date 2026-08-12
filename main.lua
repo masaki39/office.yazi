@@ -22,54 +22,36 @@ function M:peek(job)
 		return
 	end
 
-	local ok, err = self:preload(job)
-	if not ok or err then
-		return
+	local ok, err, bound = self:preload(job)
+	if bound and bound > 0 then
+		-- Past the end of the document: ask core to peek again at the real
+		-- last page instead of showing nothing. This round-trips through
+		-- core (like Yazi's own built-in `pdf.lua` previewer does), which is
+		-- only safe because of the `ya.preview_widget` call below: it's what
+		-- populates core's PreviewLock, which is what lets core's
+		-- `same_file`/`same_lock` checks recognize "still the same file,
+		-- just a different/identical page" and skip the reset+abort+
+		-- image-hide cycle that a lock-less previewer (i.e. one that only
+		-- ever calls `ya.image_show`, like this plugin used to) triggers on
+		-- *every single* peek — including this corrective one, and any
+		-- further no-op page-turns once already sitting on the last page —
+		-- which is what actually caused the preview to flash/stay black.
+		return ya.emit("peek", { bound - 1, only_if = job.file.url, upper_bound = true })
+	elseif not ok or err then
+		return ya.preview_widget(job, err)
 	end
 
 	ya.sleep(math.max(0, rt.preview.image_delay / 1000 + start - os.clock()))
-	ya.image_show(cache, job.area)
+	local _, show_err = ya.image_show(cache, job.area)
+	ya.preview_widget(job, show_err)
 end
 
 function M:seek(job)
 	local h = cx.active.current.hovered
 	if h and h.url == job.file.url then
 		local step = ya.clamp(-1, job.units, 1)
-		local skip = math.max(0, cx.active.preview.skip + step)
-
-		-- Clamp to the last known page count, if any (a pure in-memory lookup,
-		-- safe from this sync-only entrypoint — no I/O, no subprocess spawn).
-		-- Without this, core's own `preview.skip` has no upper bound and keeps
-		-- growing every time you page past the end; `preload` below already
-		-- renders the *last* page for any out-of-range `skip`, but that never
-		-- reports back to core, so a later "previous page" press only steps
-		-- `preview.skip` down by one and the document appears stuck on the
-		-- last page until you've pressed "previous" as many times as you'd
-		-- overshot by. Clamping the value we're about to request keeps
-		-- `preview.skip` itself bounded, so "previous" always works
-		-- immediately.
-		local total = M.page_counts and M.page_counts[self:pdf_path(job.file)]
-		if total then
-			skip = math.min(skip, total - 1)
-		end
-
-		ya.emit("peek", { skip, only_if = job.file.url })
+		ya.emit("peek", { math.max(0, cx.active.preview.skip + step), only_if = job.file.url })
 	end
-end
-
--- Pure, I/O-free computation of a file's PDF cache path — safe to call from
--- the sync-only `M:seek` as well as the async `M:doc2pdf`/`M:preload`. Keyed
--- on the file's url *and* its mtime/size, not just the url: a stale PDF from
--- before the source file was last edited must never be served, and scoping
--- each source file to its own subdirectory means two different files that
--- happen to share a basename can never collide in the cache.
--- Returns the cache path itself, plus its containing directory (the latter
--- only needed by `doc2pdf`, for scratch subdirectories).
-function M:pdf_path(file)
-	local cha = file.cha
-	local key = ya.hash(tostring(file.url) .. "|" .. tostring(cha and cha.mtime) .. "|" .. tostring(cha and cha.len))
-	local base = "/tmp/yazi-" .. ya.uid() .. "/" .. ya.hash("office.yazi") .. "/" .. key .. "/"
-	return base .. "cached.pdf", base
 end
 
 -- Convert the *whole* document to PDF once and cache it, instead of asking
@@ -83,7 +65,15 @@ end
 -- is a cheap `pdftoppm` extraction from the cached PDF instead of a fresh
 -- `soffice` invocation.
 function M:doc2pdf(job)
-	local pdf, base = self:pdf_path(job.file)
+	-- Key the cache dir on the file's url *and* its mtime/size, not just the
+	-- url: a stale PDF from before the source file was last edited must never
+	-- be served, and scoping each source file to its own subdirectory means
+	-- two different files that happen to share a basename can never collide
+	-- in the cache.
+	local cha = job.file.cha
+	local key = ya.hash(tostring(job.file.url) .. "|" .. tostring(cha and cha.mtime) .. "|" .. tostring(cha and cha.len))
+	local base = "/tmp/yazi-" .. ya.uid() .. "/" .. ya.hash("office.yazi") .. "/" .. key .. "/"
+	local pdf = base .. "cached.pdf"
 
 	if fs.cha(Url(pdf)) then
 		return pdf
@@ -177,6 +167,10 @@ function M:page_count(pdf)
 	return total
 end
 
+-- Returns `ok, err, bound`: `bound`, when set to a positive number, means
+-- "the requested page is past the end of the document, and the real last
+-- page is `bound - 1`" — `M:peek` turns that into a corrective `peek` at the
+-- real last page instead of trying to render/show anything for this call.
 function M:preload(job)
 	local cache = ya.file_cache(job)
 	if not cache or fs.cha(cache) then
@@ -201,67 +195,42 @@ function M:preload(job)
 		end
 	elseif total == 0 then
 		-- A "successfully" converted but empty PDF (corrupt/protected source,
-		-- ...) has no valid page at all. Must not fall into the branch below:
-		-- there is no last page to clamp `job.skip` to.
+		-- ...) has no valid page at all. Must not be treated as "past the
+		-- end" below: there is no last page to correct to, and a bound of 0
+		-- would make `M:peek` re-request `-1`.
 		return true, Err("`%s` converted to an empty PDF (0 pages)", job.file.name)
 	elseif job.skip >= total then
 		-- Past the end of the document: we know the exact last page from
-		-- `pdfinfo`, so render *that* instead of stepping back one page (and
-		-- one failed conversion) at a time.
-		--
-		-- Deliberately not corrected via a follow-up `ya.emit("peek", ...)`:
-		-- that used to ask core to peek again at total - 1, but core's
-		-- same_url/same_file checks (which decide whether the *previous*
-		-- in-flight peek gets left alone or aborted) compare against a
-		-- preview lock that only `ya.preview_widget`/`_code` ever populate —
-		-- `ya.image_show`, the only thing this plugin calls, never does. So
-		-- every single peek — including the corrective one — aborts whatever
-		-- is currently in flight, which can be *this very call* racing its
-		-- own follow-up and losing, leaving nothing shown at all. Clamping
-		-- `job.skip` locally and rendering the last page under the
-		-- originally-requested (out-of-range) cache slot avoids ever
-		-- round-tripping through core for the correction.
-		job.skip = total - 1
+		-- `pdfinfo`, so hand it back as `bound` instead of stepping back one
+		-- page (and one failed conversion) at a time.
+		return true, nil, total
 	end
 
-	local function render(skip)
-		return run(
-			"pdftoppm",
-			Command("pdftoppm")
-				:arg({
-					"-singlefile",
-					"-jpeg",
-					"-jpegopt",
-					"quality=" .. rt.preview.image_quality,
-					"-f",
-					skip + 1,
-					tostring(pdf),
-				})
-				:stdout(Command.PIPED)
-				:stderr(Command.PIPED)
-		)
-	end
-
-	local output, err = render(job.skip)
+	local output, err = run(
+		"pdftoppm",
+		Command("pdftoppm")
+			:arg({
+				"-singlefile",
+				"-jpeg",
+				"-jpegopt",
+				"quality=" .. rt.preview.image_quality,
+				"-f",
+				job.skip + 1,
+				tostring(pdf),
+			})
+			:stdout(Command.PIPED)
+			:stderr(Command.PIPED)
+	)
 
 	if not output then
 		return true, err
 	elseif not output.status.success then
 		-- Only relevant when `total` above is nil (no `pdfinfo`): pdftoppm's
 		-- own validation of the page we asked for reports the document's real
-		-- last page, so retry against that directly — same reasoning as the
-		-- `job.skip >= total` branch above for why this doesn't round-trip
-		-- through a follow-up `peek` instead.
+		-- last page, so hand it back as `bound` too — same reasoning as the
+		-- `job.skip >= total` branch above.
 		local last = not total and tonumber(output.stderr:match("the last page %((%d+)%)"))
-		if last and job.skip > last - 1 then
-			job.skip = math.max(0, last - 1)
-			output, err = render(job.skip)
-		end
-		if not output then
-			return true, err
-		elseif not output.status.success then
-			return true, Err("Failed to convert %s to image, stderr: %s", pdf, output.stderr)
-		end
+		return true, Err("Failed to convert %s to image, stderr: %s", pdf, output.stderr), last
 	end
 
 	return fs.write(cache, output.stdout)
