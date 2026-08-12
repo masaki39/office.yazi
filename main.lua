@@ -35,8 +35,41 @@ function M:seek(job)
 	local h = cx.active.current.hovered
 	if h and h.url == job.file.url then
 		local step = ya.clamp(-1, job.units, 1)
-		ya.emit("peek", { math.max(0, cx.active.preview.skip + step), only_if = job.file.url })
+		local skip = math.max(0, cx.active.preview.skip + step)
+
+		-- Clamp to the last known page count, if any (a pure in-memory lookup,
+		-- safe from this sync-only entrypoint — no I/O, no subprocess spawn).
+		-- Without this, core's own `preview.skip` has no upper bound and keeps
+		-- growing every time you page past the end; `preload` below already
+		-- renders the *last* page for any out-of-range `skip`, but that never
+		-- reports back to core, so a later "previous page" press only steps
+		-- `preview.skip` down by one and the document appears stuck on the
+		-- last page until you've pressed "previous" as many times as you'd
+		-- overshot by. Clamping the value we're about to request keeps
+		-- `preview.skip` itself bounded, so "previous" always works
+		-- immediately.
+		local total = M.page_counts and M.page_counts[self:pdf_path(job.file)]
+		if total then
+			skip = math.min(skip, total - 1)
+		end
+
+		ya.emit("peek", { skip, only_if = job.file.url })
 	end
+end
+
+-- Pure, I/O-free computation of a file's PDF cache path — safe to call from
+-- the sync-only `M:seek` as well as the async `M:doc2pdf`/`M:preload`. Keyed
+-- on the file's url *and* its mtime/size, not just the url: a stale PDF from
+-- before the source file was last edited must never be served, and scoping
+-- each source file to its own subdirectory means two different files that
+-- happen to share a basename can never collide in the cache.
+-- Returns the cache path itself, plus its containing directory (the latter
+-- only needed by `doc2pdf`, for scratch subdirectories).
+function M:pdf_path(file)
+	local cha = file.cha
+	local key = ya.hash(tostring(file.url) .. "|" .. tostring(cha and cha.mtime) .. "|" .. tostring(cha and cha.len))
+	local base = "/tmp/yazi-" .. ya.uid() .. "/" .. ya.hash("office.yazi") .. "/" .. key .. "/"
+	return base .. "cached.pdf", base
 end
 
 -- Convert the *whole* document to PDF once and cache it, instead of asking
@@ -50,15 +83,7 @@ end
 -- is a cheap `pdftoppm` extraction from the cached PDF instead of a fresh
 -- `soffice` invocation.
 function M:doc2pdf(job)
-	-- Key the cache dir on the file's url *and* its mtime/size, not just the
-	-- url: a stale PDF from before the source file was last edited must never
-	-- be served, and scoping each source file to its own subdirectory means
-	-- two different files that happen to share a basename can never collide
-	-- in the cache.
-	local cha = job.file.cha
-	local key = ya.hash(tostring(job.file.url) .. "|" .. tostring(cha and cha.mtime) .. "|" .. tostring(cha and cha.len))
-	local base = "/tmp/yazi-" .. ya.uid() .. "/" .. ya.hash("office.yazi") .. "/" .. key .. "/"
-	local pdf = base .. "cached.pdf"
+	local pdf, base = self:pdf_path(job.file)
 
 	if fs.cha(Url(pdf)) then
 		return pdf
