@@ -2,6 +2,21 @@
 
 local M = {}
 
+-- `seek` runs in a separate, *sync* Lua state from `peek`/`preload`/
+-- `doc2pdf` (which run in an isolated async state) — plain fields on `M` are
+-- NOT shared between them, they're two independent tables. `ya.sync()` is
+-- the only bridge: the function passed to it runs against a `state` table
+-- that *is* shared/persistent across both, regardless of which side calls
+-- the wrapper. Used here so `M:seek` can see the page count `M:page_count`
+-- (async side) has already memoized, without re-deriving it itself (it
+-- can't: getting it requires `pdfinfo`, a blocking subprocess call `seek`'s
+-- sync-only context isn't allowed to make).
+local get_total = ya.sync(function(state, pdf) return state.page_counts and state.page_counts[pdf] end)
+local set_total = ya.sync(function(state, pdf, total)
+	state.page_counts = state.page_counts or {}
+	state.page_counts[pdf] = total
+end)
+
 -- Run an already-configured `cmd`, returning its Output on success or
 -- `nil, Err(...)` if the process couldn't even be spawned (missing binary,
 -- etc.). Doesn't look at `output.status.success` — callers still need to
@@ -52,22 +67,22 @@ function M:seek(job)
 		local step = ya.clamp(-1, job.units, 1)
 		local skip = math.max(0, cx.active.preview.skip + step)
 
-		-- Clamp to the last known page count, if any (a pure in-memory lookup,
-		-- safe from this sync-only entrypoint — no I/O, no subprocess spawn).
-		-- Without this, holding/repeatedly pressing the next-page key past the
-		-- end can request `preview.skip` faster than each out-of-range
-		-- request's corrective round-trip (see `M:peek`'s `bound` handling)
-		-- can rein it back in: every plain keypress sets `preview.skip`
-		-- unconditionally, so it can keep drifting upward for as long as the
-		-- key is held, even though what's on screen stays correctly pinned to
-		-- the last page throughout (no black screen — that part is what the
-		-- lock/`ya.preview_widget` fix below addresses). The drift itself,
-		-- though, means "previous page" afterwards only undoes one keypress
-		-- at a time, requiring as many presses to recover as were spent
-		-- overshooting. Clamping the value we're about to request keeps
-		-- `preview.skip` itself bounded, so "previous page" always works
-		-- immediately.
-		local total = M.page_counts and M.page_counts[self:pdf_path(job.file)]
+		-- Clamp to the last known page count, if any (via `get_total` above —
+		-- a shared-state lookup, not a subprocess call, so it's fine to do
+		-- from this sync-only entrypoint). Without this, holding/repeatedly
+		-- pressing the next-page key past the end can request `preview.skip`
+		-- faster than each out-of-range request's corrective round-trip (see
+		-- `M:peek`'s `bound` handling) can rein it back in: every plain
+		-- keypress sets `preview.skip` unconditionally, so it can keep
+		-- drifting upward for as long as the key is held, even though what's
+		-- on screen stays correctly pinned to the last page throughout (no
+		-- black screen — that part is what the lock/`ya.preview_widget` fix
+		-- below addresses). The drift itself, though, means "previous page"
+		-- afterwards only undoes one keypress at a time, requiring as many
+		-- presses to recover as were spent overshooting. Clamping the value
+		-- we're about to request keeps `preview.skip` itself bounded, so
+		-- "previous page" always works immediately.
+		local total = get_total(self:pdf_path(job.file))
 		if total then
 			skip = math.min(skip, total - 1)
 		end
@@ -179,20 +194,19 @@ end
 -- from "not computed yet") instead of re-spawning `pdfinfo` on every single
 -- page turn.
 function M:page_count(pdf)
-	M.page_counts = M.page_counts or {}
-	local cached = M.page_counts[pdf]
+	local cached = get_total(pdf)
 	if cached ~= nil then
 		return cached or nil
 	end
 
 	local output = run("pdfinfo", Command("pdfinfo"):arg({ tostring(pdf) }):stdout(Command.PIPED):stderr(Command.PIPED))
 	if not output or not output.status.success then
-		M.page_counts[pdf] = false
+		set_total(pdf, false)
 		return nil
 	end
 
 	local total = tonumber(output.stdout:match("Pages:%s*(%d+)"))
-	M.page_counts[pdf] = total or false
+	set_total(pdf, total or false)
 	return total
 end
 
