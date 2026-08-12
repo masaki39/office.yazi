@@ -177,52 +177,66 @@ function M:preload(job)
 	elseif total == 0 then
 		-- A "successfully" converted but empty PDF (corrupt/protected source,
 		-- ...) has no valid page at all. Must not fall into the branch below:
-		-- its target page would be math.max(0, 0-1) = 0, identical to the
-		-- job.skip = 0 that got us here, which would emit a `peek` back to the
-		-- same skip forever.
+		-- there is no last page to clamp `job.skip` to.
 		return true, Err("`%s` converted to an empty PDF (0 pages)", job.file.name)
 	elseif job.skip >= total then
 		-- Past the end of the document: we know the exact last page from
-		-- `pdfinfo`, so jump straight there instead of stepping back one page
-		-- (and one failed conversion) at a time. This must return an error too,
-		-- not just `true`: an empty `ok`/`err` pair would fall through to
-		-- `M:peek`'s `ya.image_show`, which would show whatever (nothing) was
-		-- cached for this out-of-range `job.skip` before the corrective peek
-		-- above lands.
-		ya.emit("peek", { total - 1, only_if = job.file.url, upper_bound = true })
-		return true, Err("Page %d is past the end of `%s` (%d pages)", job.skip + 1, job.file.name, total)
+		-- `pdfinfo`, so render *that* instead of stepping back one page (and
+		-- one failed conversion) at a time.
+		--
+		-- Deliberately not corrected via a follow-up `ya.emit("peek", ...)`:
+		-- that used to ask core to peek again at total - 1, but core's
+		-- same_url/same_file checks (which decide whether the *previous*
+		-- in-flight peek gets left alone or aborted) compare against a
+		-- preview lock that only `ya.preview_widget`/`_code` ever populate —
+		-- `ya.image_show`, the only thing this plugin calls, never does. So
+		-- every single peek — including the corrective one — aborts whatever
+		-- is currently in flight, which can be *this very call* racing its
+		-- own follow-up and losing, leaving nothing shown at all. Clamping
+		-- `job.skip` locally and rendering the last page under the
+		-- originally-requested (out-of-range) cache slot avoids ever
+		-- round-tripping through core for the correction.
+		job.skip = total - 1
 	end
 
-	local output, err = run(
-		"pdftoppm",
-		Command("pdftoppm")
-			:arg({
-				"-singlefile",
-				"-jpeg",
-				"-jpegopt",
-				"quality=" .. rt.preview.image_quality,
-				"-f",
-				job.skip + 1,
-				tostring(pdf),
-			})
-			:stdout(Command.PIPED)
-			:stderr(Command.PIPED)
-	)
+	local function render(skip)
+		return run(
+			"pdftoppm",
+			Command("pdftoppm")
+				:arg({
+					"-singlefile",
+					"-jpeg",
+					"-jpegopt",
+					"quality=" .. rt.preview.image_quality,
+					"-f",
+					skip + 1,
+					tostring(pdf),
+				})
+				:stdout(Command.PIPED)
+				:stderr(Command.PIPED)
+		)
+	end
+
+	local output, err = render(job.skip)
 
 	if not output then
 		return true, err
 	elseif not output.status.success then
 		-- Only relevant when `total` above is nil (no `pdfinfo`): pdftoppm's
 		-- own validation of the page we asked for reports the document's real
-		-- last page, so use it to self-correct the same way the `pdfinfo` path
-		-- does, instead of getting permanently stuck on a failed page.
-		if not total then
-			local last = tonumber(output.stderr:match("the last page %((%d+)%)"))
-			if last and job.skip > last - 1 then
-				ya.emit("peek", { math.max(0, last - 1), only_if = job.file.url, upper_bound = true })
-			end
+		-- last page, so retry against that directly — same reasoning as the
+		-- `job.skip >= total` branch above for why this doesn't round-trip
+		-- through a follow-up `peek` instead.
+		local last = not total and tonumber(output.stderr:match("the last page %((%d+)%)"))
+		if last and job.skip > last - 1 then
+			job.skip = math.max(0, last - 1)
+			output, err = render(job.skip)
 		end
-		return true, Err("Failed to convert %s to image, stderr: %s", pdf, output.stderr)
+		if not output then
+			return true, err
+		elseif not output.status.success then
+			return true, Err("Failed to convert %s to image, stderr: %s", pdf, output.stderr)
+		end
 	end
 
 	return fs.write(cache, output.stdout)
